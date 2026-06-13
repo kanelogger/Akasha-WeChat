@@ -52,6 +52,14 @@ IMAGE_CAPTION_PROMPT = config.get("image_caption_prompt", "请用中文简短描
 OLLAMA_BASE_URL = config.get("ollama_base_url", "http://127.0.0.1:61000")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
 
+# ============ 鼠标漫游（反风控）============
+
+WANDERER_ENABLED = config.get("wanderer_enabled", False)
+WANDERER_MIN_INTERVAL = config.get("wanderer_min_interval", 10.0)
+WANDERER_MAX_INTERVAL = config.get("wanderer_max_interval", 30.0)
+WANDERER_TIMES_MIN = config.get("wanderer_times_min", 1)
+WANDERER_TIMES_MAX = config.get("wanderer_times_max", 3)
+
 # ============ 日志 ============
 
 logging.basicConfig(

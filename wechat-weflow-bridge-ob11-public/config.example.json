@@ -20,5 +20,12 @@
     "image_caption_model": "llava:7b",
     "image_caption_api_key": "",
     "image_caption_api_base": "https://api.moonshot.cn/v1",
-    "image_caption_prompt": "请用中文简短描述这张图片的内容"
+    "image_caption_prompt": "请用中文简短描述这张图片的内容",
+
+    "_comment_wanderer": "鼠标漫游反风控配置（默认关闭，保持向后兼容）",
+    "wanderer_enabled": false,
+    "wanderer_min_interval": 10.0,
+    "wanderer_max_interval": 30.0,
+    "wanderer_times_min": 1,
+    "wanderer_times_max": 3
 }

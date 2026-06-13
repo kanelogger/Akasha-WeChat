@@ -21,12 +21,135 @@ uia_sender.py — 基于 Windows UI Automation 的微信 4.0+ 消息发送器
 
 import logging
 import os
+import ctypes
 import re
-import subprocess
 import threading
 import time
 
 log = logging.getLogger("weflow-bridge")
+
+# ── SendInput 键盘模拟结构 ──
+# 使用 SendInput 替代已弃用的 keybd_event（参考 WeeMessenger 实现）
+
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         ctypes.c_ushort),
+        ("wScan",       ctypes.c_ushort),
+        ("dwFlags",     ctypes.c_ulong),
+        ("time",        ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_ulonglong),
+    ]
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx",          ctypes.c_long),
+        ("dy",          ctypes.c_long),
+        ("mouseData",   ctypes.c_ulong),
+        ("dwFlags",     ctypes.c_ulong),
+        ("time",        ctypes.c_ulong),
+        ("dwExtraInfo", ctypes.c_ulonglong),
+    ]
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg",    ctypes.c_ulong),
+        ("wParamL", ctypes.c_ushort),
+        ("wParamH", ctypes.c_ushort),
+    ]
+
+class _INPUT_UNION(ctypes.Union):
+    _fields_ = [
+        ("mi", _MOUSEINPUT),
+        ("ki", _KEYBDINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type",  ctypes.c_ulong),
+        ("union", _INPUT_UNION),
+    ]
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+
+
+def _send_key(vk_code: int, key_up: bool = False):
+    """通过 SendInput 发送单个键盘事件（替代已弃用的 keybd_event）"""
+    flags = KEYEVENTF_KEYUP if key_up else 0
+    inp = _INPUT(
+        type=INPUT_KEYBOARD,
+        union=_INPUT_UNION(ki=_KEYBDINPUT(
+            wVk=vk_code, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0,
+        )),
+    )
+    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+    if sent != 1:
+        log.warning(f"SendInput 返回 {sent}，按键模拟可能未生效")
+
+
+# ── CF_HDROP 剪贴板 ──
+# 将文件以 CF_HDROP 格式放入剪贴板，微信原生支持该格式。
+# 替代 PowerShell 图片粘贴方案，更快更可靠（参考 WeeMessenger 实现）。
+
+class _DROPFILES(ctypes.Structure):
+    """CF_HDROP 剪贴板格式所需的文件拖放结构"""
+    _fields_ = [
+        ("pFiles", ctypes.c_uint),
+        ("pt",     ctypes.c_long * 2),
+        ("fNC",    ctypes.c_int),
+        ("fWide",  ctypes.c_int),
+    ]
+
+
+def copy_file_to_clipboard(file_path: str):
+    """将文件以 CF_HDROP 格式放入剪贴板。微信能识别该格式，粘贴后可直接发送图片/文件。"""
+    file_path = os.path.abspath(file_path)
+
+    file_list = file_path + '\x00\x00'
+    file_list_bytes = file_list.encode('utf-16-le')
+
+    header_size = ctypes.sizeof(_DROPFILES)
+    total_size = header_size + len(file_list_bytes)
+
+    GMEM_MOVEABLE = 0x0002
+    hGlobal = ctypes.windll.kernel32.GlobalAlloc(GMEM_MOVEABLE, total_size)
+    if not hGlobal:
+        raise RuntimeError("GlobalAlloc 失败")
+
+    try:
+        locked_mem = ctypes.windll.kernel32.GlobalLock(hGlobal)
+        if not locked_mem:
+            raise RuntimeError("GlobalLock 失败")
+
+        try:
+            df = _DROPFILES()
+            df.pFiles = header_size
+            df.pt[0] = 0
+            df.pt[1] = 0
+            df.fNC = 0
+            df.fWide = 1
+
+            ctypes.memmove(locked_mem, ctypes.addressof(df), header_size)
+            ctypes.memmove(locked_mem + header_size, file_list_bytes, len(file_list_bytes))
+        finally:
+            ctypes.windll.kernel32.GlobalUnlock(hGlobal)
+
+        if not ctypes.windll.user32.OpenClipboard(None):
+            raise RuntimeError("无法打开剪贴板")
+
+        try:
+            ctypes.windll.user32.EmptyClipboard()
+            CF_HDROP = 15
+            if not ctypes.windll.user32.SetClipboardData(CF_HDROP, hGlobal):
+                raise RuntimeError("SetClipboardData 失败")
+            hGlobal = None
+        finally:
+            ctypes.windll.user32.CloseClipboard()
+
+    finally:
+        if hGlobal:
+            ctypes.windll.kernel32.GlobalFree(hGlobal)
 
 
 class BaseSender:
@@ -345,32 +468,32 @@ class UiaSender(BaseSender):
 
         try:
             # Ctrl+F 打开搜索
-            ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)   # Ctrl
-            ctypes.windll.user32.keybd_event(0x46, 0, 0, 0)   # F
-            ctypes.windll.user32.keybd_event(0x46, 0, 2, 0)
-            ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
+            _send_key(0x11)       # Ctrl down
+            _send_key(0x46)       # F down
+            _send_key(0x46, True) # F up
+            _send_key(0x11, True) # Ctrl up
             time.sleep(0.5)
 
             # 清空搜索框
-            ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)   # Ctrl
-            ctypes.windll.user32.keybd_event(0x41, 0, 0, 0)   # A
-            ctypes.windll.user32.keybd_event(0x41, 0, 2, 0)
-            ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
+            _send_key(0x11)       # Ctrl down
+            _send_key(0x41)       # A down
+            _send_key(0x41, True) # A up
+            _send_key(0x11, True) # Ctrl up
             time.sleep(0.15)
 
             # 粘贴联系人/群名
             import pyperclip
             pyperclip.copy(contact)
             time.sleep(0.1)
-            ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)   # Ctrl
-            ctypes.windll.user32.keybd_event(0x56, 0, 0, 0)   # V
-            ctypes.windll.user32.keybd_event(0x56, 0, 2, 0)
-            ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
+            _send_key(0x11)       # Ctrl down
+            _send_key(0x56)       # V down
+            _send_key(0x56, True) # V up
+            _send_key(0x11, True) # Ctrl up
             time.sleep(0.3)
 
             # Enter → 选中第一个结果
-            ctypes.windll.user32.keybd_event(0x0D, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(0x0D, 0, 2, 0)
+            _send_key(0x0D)       # Enter down
+            _send_key(0x0D, True) # Enter up
             time.sleep(0.8)
 
             log.info(f"已切到联系人: {contact}")
@@ -613,7 +736,7 @@ class UiaSender(BaseSender):
                         self._last_contact = contact
 
                 # 复制图片到剪贴板
-                self._copy_image_to_clipboard(image_path)
+                copy_file_to_clipboard(image_path)
                 time.sleep(0.2)
 
                 if not self._locate_input():
@@ -655,21 +778,6 @@ class UiaSender(BaseSender):
                 log.error(f"[UIA✗] 图片 → {contact}: {e}")
                 return False
 
-    def _copy_image_to_clipboard(self, path: str):
-        """复制图片到剪贴板（通过 PowerShell，避免 PIL 对象被当作文本复制）"""
-        abs_path = os.path.abspath(path)
-        try:
-            subprocess.run([
-                "powershell", "-WindowStyle", "Hidden", "-Command",
-                f"Add-Type -AssemblyName System.Windows.Forms;"
-                f"$img = [System.Drawing.Image]::FromFile('{abs_path}');"
-                f"[System.Windows.Forms.Clipboard]::SetImage($img);"
-                f"$img.Dispose()"
-            ], check=True, timeout=10)
-            log.debug("PowerShell 已复制图片到剪贴板")
-        except Exception as e:
-            log.error(f"复制图片到剪贴板失败: {e}")
-            raise
 
     # ================================================================
     # 诊断

@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+import ctypes
 
 import requests
 
@@ -20,8 +21,30 @@ from ob_client import _run_ob_client
 from bridge_core import WeFlowBridge
 from web_panel import WebHandler, PAGE
 from http.server import HTTPServer
+from socketserver import ThreadingMixIn
 
 log = logging.getLogger("ob11-bridge")
+
+# ── DPI Awareness ──
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+
+# ── 鼠标漫游（反风控）──
+if config.WANDERER_ENABLED:
+    from mouse_wanderer import MouseWanderer
+    _mouse_wanderer = MouseWanderer(
+        min_interval=config.WANDERER_MIN_INTERVAL,
+        max_interval=config.WANDERER_MAX_INTERVAL,
+        wander_times_range=(config.WANDERER_TIMES_MIN, config.WANDERER_TIMES_MAX),
+    )
+else:
+    _mouse_wanderer = None
+
+# ── 多线程 HTTP 服务器 ──
+class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
 
 # ============ 启动 / 停止 ============
@@ -43,9 +66,16 @@ def _start_bridge():
     state.bridge_thread = threading.Thread(target=_bridge_loop, daemon=True, name="bridge")
     state.bridge_thread.start()
     log.info("[Web] 已启动")
+    # 启动鼠标漫游（反风控）
+    if _mouse_wanderer is not None:
+        _mouse_wanderer.start()
 
 
 def _stop_bridge():
+    # 停止鼠标漫游
+    if _mouse_wanderer is not None:
+        _mouse_wanderer.stop()
+
     with state.run_lock:
         state.running = False
 
@@ -133,7 +163,7 @@ def _bridge_loop():
 
 
 def start_web():
-    server = HTTPServer(("127.0.0.1", config.WEB_PORT), WebHandler)
+    server = _ThreadingHTTPServer(("127.0.0.1", config.WEB_PORT), WebHandler)
     log.info(f"Web: http://127.0.0.1:{config.WEB_PORT}")
     server.serve_forever()
 
