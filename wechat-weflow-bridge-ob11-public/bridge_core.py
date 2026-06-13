@@ -233,20 +233,32 @@ class WeFlowBridge:
                     data_str = line[5:].strip()
                     if not data_str:
                         continue
-                    try:
-                        data = json.loads(data_str)
-                        msg_time = data.get("timestamp", 0)
-                        if msg_time < self.start_timestamp:
-                            continue
-                        raw_id = data.get("rawid", "")
-                        if raw_id in self.processed_ids:
-                            continue
-                        self.processed_ids.add(raw_id)
-                        if not self.should_ignore(data):
-                            log.info(f"📩 收到: {data.get('sourceName','')} → {data.get('content','')[:50]}")
-                            self.add_to_buffer(data)
-                    except json.JSONDecodeError:
-                        pass
+                elif line.startswith("{"):
+                    # WeFlow 部分版本 SSE 消息是裸 JSON 行（不以 data: 开头）
+                    data_str = line
+                else:
+                    # event:, :ping 等 SSE 控制行，忽略
+                    continue
+                try:
+                    data = json.loads(data_str)
+                    # WeFlow SSE 版本字段适配
+                    if "messageKey" in data and "rawid" not in data:
+                        data["rawid"] = data["messageKey"]  # 唯一 ID
+                    data.setdefault("timestamp", 0)
+                    data.setdefault("talkerId", "")
+                    msg_time = data.get("timestamp", 0)
+                    # 没有 timestamp 字段的消息（msg_time==0）不跳过
+                    if msg_time > 0 and msg_time < self.start_timestamp:
+                        continue
+                    raw_id = data.get("rawid", "")
+                    if raw_id in self.processed_ids:
+                        continue
+                    self.processed_ids.add(raw_id)
+                    if not self.should_ignore(data):
+                        log.info(f"📩 收到: {data.get('sourceName','')} → {data.get('content','')[:50]}")
+                        self.add_to_buffer(data)
+                except json.JSONDecodeError:
+                    pass
 
         except requests.exceptions.ConnectionError:
             log.error("无法连接 WeFlow")

@@ -97,13 +97,19 @@ def _bridge_loop():
         state.bridge_instance = bridge
 
     try:
-        r = requests.get(f"{config.WE_FLOW_BASE_URL}/api/v1/messages?limit=1&access_token={config.ACCESS_TOKEN}", timeout=5)
+        # 用 SSE 端点做探活（stream=True 只检查状态码，不读 body）
+        r = requests.get(
+            f"{config.WE_FLOW_BASE_URL}/api/v1/push/messages?access_token={config.ACCESS_TOKEN}",
+            stream=True, timeout=5
+        )
+        r.close()
         if r.status_code == 200:
             log.info("✅ WeFlow API 正常")
         elif r.status_code == 401:
             log.error("❌ Access Token 无效")
             state.running = False
             return
+        # 其他错误（403 等）不阻断——SSE 循环内部有自动重试
     except requests.exceptions.ConnectionError:
         log.error("❌ 无法连接 WeFlow")
         state.running = False

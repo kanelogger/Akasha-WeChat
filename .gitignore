@@ -1,0 +1,9 @@
+# Python bytecode
+__pycache__/
+
+# Runtime artifacts
+*.log
+*.pid
+
+# Sensitive config
+config.json

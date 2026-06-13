@@ -96,7 +96,7 @@ class UiaSender(BaseSender):
             self._ready = True
 
     def _find_window(self):
-        """按标题搜索微信窗口"""
+        """按标题搜索微信窗口；找不到时尝试枚举 WeChatAppEx 进程的所有窗口"""
         auto = self._auto
         root = auto.GetRootControl()
         for w in root.GetChildren():
@@ -109,23 +109,81 @@ class UiaSender(BaseSender):
                     if cls != "WeChatMainWndForPC":
                         self._is_electron = True
                     return
+        # 按标题没找到 → 通过进程枚举窗口（微信可能最小化到托盘）
+        import ctypes
+        from ctypes import wintypes, windll
+        user32 = windll.user32
+        WECHAT_PIDS = set()
+        # 找所有 WeChatAppEx 进程
+        kernel32 = windll.kernel32
+        psapi = windll.psapi
+        cbNeeded = wintypes.DWORD()
+        proc_ids = (wintypes.DWORD * 1024)()
+        psapi.EnumProcesses(ctypes.byref(proc_ids), ctypes.sizeof(proc_ids), ctypes.byref(cbNeeded))
+        n_procs = cbNeeded.value // ctypes.sizeof(wintypes.DWORD)
+        # 用 CreateToolhelp32Snapshot 更可靠，但简单方式：直接枚举窗口
+        hwnd_list = []
+        def enum_callback(hwnd, _):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            exe_name = ctypes.create_unicode_buffer(260)
+            kernel32.GetModuleBaseNameW(user32.GetWindowThreadProcessId(hwnd, None), None, exe_name, 260)
+            # 简单方式：检查进程名
+            h_process = kernel32.OpenProcess(0x0400 | 0x0010, False, pid.value)
+            if h_process:
+                mod_name = ctypes.create_unicode_buffer(260)
+                psapi.GetModuleBaseNameW(h_process, None, mod_name, 260)
+                kernel32.CloseHandle(h_process)
+                if "WeChatAppEx" in mod_name.value or "WeChat" in mod_name.value:
+                    title = ctypes.create_unicode_buffer(512)
+                    user32.GetWindowTextW(hwnd, title, 512)
+                    if title.value:
+                        hwnd_list.append((hwnd, title.value))
+            return True
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(WNDENUMPROC(enum_callback), 0)
+        if hwnd_list:
+            # 取第一个找到的窗口，尝试恢复
+            hwnd, title = hwnd_list[0]
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            time.sleep(0.5)
+            # 重新用 UIA 查找（窗口已恢复，标题应包含"微信"）
+            for w in root.GetChildren():
+                cls = w.ClassName
+                if cls in self.EXCLUDE_CLASSES:
+                    continue
+                for kw in self.WECHAT_TITLES:
+                    if kw in w.Name:
+                        self._window = w
+                        if cls != "WeChatMainWndForPC":
+                            self._is_electron = True
+                        return
+            # UIA 仍找不到，直接用窗口句柄创建 UIA 元素
+            try:
+                uia_elem = auto.ElementFromHandle(hwnd)
+                if uia_elem:
+                    self._window = uia_elem
+                    self._is_electron = True
+                    return
+            except Exception:
+                pass
 
     # ================================================================
     # 控件定位
     # ================================================================
 
     def _ensure_window(self) -> bool:
-        """确保窗口可用"""
-        if not self._ready:
-            return False
+        """确保窗口可用（每次调用都会重试查找，不依赖 _ready 缓存）"""
         if self._window and self._window.Exists(0.2):
+            self._ready = True
             return True
         self._find_window()
-        if not self._window:
-            log.warning("微信窗口未找到")
-            self._ready = False
-            return False
-        return True
+        if self._window:
+            self._ready = True
+            return True
+        log.warning("微信窗口未找到，发送将跳过")
+        self._ready = False
+        return False
 
     def _activate(self):
         """激活微信窗口到前台（AttachThreadInput 确保后台也能生效）"""
@@ -408,52 +466,37 @@ class UiaSender(BaseSender):
             log.debug(f"后备输入控件: {self._input_control.ControlTypeName} "
                       f"'{self._input_control.Name[:30]}'")
 
-        # 查找发送按钮
-        try:
-            buttons = []
+        for ctrl in candidates:
+            if ctrl.BoundingRectangle and ctrl.IsValuePatternAvailable:
+                self._input_control = ctrl
+                break
 
-            def find_buttons(ctrl, depth=0):
-                if depth > 8:
-                    return
+        if not self._input_control and edits:
+            self._input_control = edits[0]
+
+        if self._input_control:
+            search_btn = self._window.FindFirst(TreeScope.Subtree,
+                self._auto.CreatePropertyCondition(self._auto.UIA_ControlTypeId, self._auto.ControlType.Button))
+            while search_btn:
                 try:
-                    for child in ctrl.GetChildren():
-                        if child.ControlTypeName == "ButtonControl":
-                            bn = child.Name or ""
-                            if "发送" in bn or "Send" in bn or bn.strip() == "":
-                                buttons.append(child)
-                        find_buttons(child, depth + 1)
+                    if "发送" in (search_btn.Name or ""):
+                        self._send_button = search_btn
+                        break
                 except Exception:
                     pass
-
-            find_buttons(self._window)
-            if buttons:
-                self._send_button = buttons[0]
-                log.info("已定位发送按钮")
-            else:
-                log.info("未找到发送按钮，发送时用 Enter")
-        except Exception:
-            pass
+                break
 
         return True
 
     # ================================================================
-    # 发送方法
+    # 发送
     # ================================================================
 
     def send_text(self, contact: str, text: str) -> bool:
-        """
-        发送文本消息
-
-        Args:
-            contact: 联系人昵称/备注
-            text: 消息内容
-        """
+        """发送文本消息"""
         with self._lock:
-            if not self._ready:
-                log.error("UIA Sender 未就绪")
-                return False
-
             if not self._ensure_window():
+                log.error("UIA Sender 未就绪")
                 return False
 
             # 安全检查：过滤 PIL 引用
@@ -463,50 +506,51 @@ class UiaSender(BaseSender):
 
             self._activate()
 
-            # 切换到联系人（物理点击搜索框，坐标后备模式下也有效）
+            # 切换到联系人
             if self.search_enabled and contact:
                 if contact != self._last_contact:
                     if not self._switch_contact(contact):
                         log.warning(f"无法自动切换到 '{contact}'，尝试在当前窗口发送")
                     self._last_contact = contact
-
             # 定位输入框
             if not self._locate_input():
                 return False
 
             try:
                 if self._use_coord_fallback:
-                    # Qt 界面：点击输入框区域→剪贴板粘贴→Enter
+                    # 键盘模拟方案（参考 WeeMessenger）：不依赖坐标点击
                     import pyperclip
-                    import ctypes
-                    from ctypes import wintypes
-                    hwnd = ctypes.windll.user32.FindWindowW('Qt51514QWindowIcon', None)
-                    if not hwnd:
-                        hwnd = ctypes.windll.user32.FindWindowW('WeChatMainWndForPC', None)
-                    if hwnd:
-                        rect = wintypes.RECT()
-                        ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                        win_w = rect.right - rect.left
-                        win_h = rect.bottom - rect.top
-                        # 输入框大致在窗口底部居中偏左的位置
-                        input_x = rect.left + int(win_w * 0.3)
-                        input_y = rect.top + int(win_h * 0.92)
-                        # 物理点击让输入框获得焦点（PostMessage 对 Qt 子控件无效）
-                        ctypes.windll.user32.SetCursorPos(input_x, input_y)
-                        ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # down
-                        ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # up
-                    time.sleep(0.3)
-                    pyperclip.copy(text)
-                    time.sleep(0.05)
-                    self._auto.SendKeys('{Ctrl}v')
-                    time.sleep(0.3)
-                    self._auto.SendKeys('{Enter}')
-                    log.info(f"[UIA✓] {contact}: {text[:50]}... (无鼠标模式)")
-                    return True
+                    window = self._auto.WindowControl(searchDepth=1, ClassName='Qt51514QWindowIcon')
+                    if not window.Exists(0, 0):
+                        window = self._auto.WindowControl(searchDepth=1, ClassName='WeChatMainWndForPC')
+                    if not window.Exists(0, 0):
+                        window = self._auto.WindowControl(searchDepth=1, Name='微信')
+                    if window.Exists(0, 0):
+                        window.SetActive()
+                        time.sleep(0.3)
+                        pyperclip.copy(text)
+                        time.sleep(0.1)
+                        if self._last_contact != contact:
+                            self._auto.SendKeys('{Ctrl}f')
+                            time.sleep(0.4)
+                            self._auto.SendKeys('{Ctrl}a')
+                            time.sleep(0.1)
+                            pyperclip.copy(contact)
+                            self._auto.SendKeys('{Ctrl}v')
+                            time.sleep(0.1)
+                            self._auto.SendKeys('{Enter}')
+                            time.sleep(0.8)
+                            self._last_contact = contact
+                        self._auto.SendKeys('{Ctrl}v')
+                        time.sleep(0.5)
+                        self._auto.SendKeys('{Enter}')
+                        log.info(f"[UIA✓] {contact}: {text[:50]}...")
+                        return True
+                    log.error(f"[UIA✗] {contact}: 找不到微信窗口")
+                    return False
 
                 ctrl = self._input_control
 
-                # 设置文本
                 if ctrl.IsValuePatternAvailable:
                     try:
                         ctrl.SetValue("")
@@ -523,7 +567,6 @@ class UiaSender(BaseSender):
                         ctrl.SendKeys('{Ctrl}a')
                         ctrl.SendKeys('{Ctrl}v')
                 else:
-                    # 没有 ValuePattern，用剪贴板
                     import pyperclip
                     pyperclip.copy(text)
                     ctrl.SendKeys('{Ctrl}a')
@@ -532,7 +575,6 @@ class UiaSender(BaseSender):
 
                 time.sleep(0.1)
 
-                # 发送
                 if self._send_button:
                     self._send_button.Click()
                 else:

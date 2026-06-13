@@ -398,7 +398,10 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
-            self.wfile.write(PAGE.encode("utf-8"))
+            try:
+                self.wfile.write(PAGE.encode("utf-8"))
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                pass
 
     def do_POST(self):
         if self.path == "/start":
