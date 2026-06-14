@@ -1,9 +1,36 @@
-# Python bytecode
+# === Python bytecode ===
 __pycache__/
+*.pyc
+*.pyo
 
-# Runtime artifacts
+# === Runtime artifacts ===
 *.log
 *.pid
 
-# Sensitive config
+# === Sensitive config (tokens, API keys, wxid) ===
 config.json
+config*.json.bak
+config*.json.backup
+config*.json.tmp
+*.env
+.env
+.env.*
+!.env.example
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS junk ===
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# === Temp & backup ===
+*.bak
+*.backup
+*.tmp
+*.temp
