@@ -9,6 +9,7 @@
 """
 
 import json
+import base64
 import logging
 import os
 import queue
@@ -183,22 +184,39 @@ class WeFlowBridge:
                 if sender_name:
                     formatted = f'{sender_name}在群{entry.get("group_name", contact)}中说：{clean_text}'
 
-            # 消息段：先 at 机器人（让 aiocqhttp 识别为 @），再发文本
+            # 消息段：先 at 机器人（让 aiocqhttp 识别为 @），再发图片（如有），最后发文本
             msg_segments = [
                 {"type": "at", "data": {"qq": str(state._self_id_int)}},
-                {"type": "text", "data": {"text": f" {formatted}"}},
             ]
+            image_path = entry.get("image_path")
+            if image_path and os.path.exists(image_path):
+                try:
+                    with open(image_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    msg_segments.append({"type": "image", "data": {"file": f"base64://{b64}"}})
+                    log.info(f"🖼️ 已附加图片到群聊事件")
+                except Exception as e:
+                    log.warning(f"读取图片文件失败: {e}")
+            msg_segments.append({"type": "text", "data": {"text": f" {formatted}"}})
             event = make_message_event("group", user_id, msg_segments,
                                        group_id=group_id,
                                        group_name=entry.get("group_name", contact),
                                        nickname=sender_name)
         else:
             sender_name = entry.get("source_name", contact)
+            msg_segments = [{"type": "text", "data": {"text": combined}}]
+            image_path = entry.get("image_path")
+            if image_path and os.path.exists(image_path):
+                try:
+                    with open(image_path, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode()
+                    msg_segments.insert(0, {"type": "image", "data": {"file": f"base64://{b64}"}})
+                    log.info(f"🖼️ 已附加图片到私聊事件")
+                except Exception as e:
+                    log.warning(f"读取图片文件失败: {e}")
             event = make_message_event("private", user_id,
-                                       [{"type": "text", "data": {"text": combined}}],
+                                       msg_segments,
                                        nickname=sender_name)
-
-        # 记录 user_id → contact 映射，供 API 回复时查找
         if is_group:
             group_id = state._wxid_to_int(entry.get("group_name", contact))
             state._ob_id_to_contact[group_id] = contact
@@ -259,7 +277,13 @@ class WeFlowBridge:
                         continue
                     self.processed_ids.add(raw_id)
                     if not self.should_ignore(data):
-                        log.info(f"📩 收到: {data.get('sourceName','')} → {data.get('content','')[:50]}")
+                        content = data.get('content', '')
+                        source = data.get('sourceName', '')
+                        log.info(f"📩 收到: {source} → {content[:50]}")
+                        if content == "[图片]":
+                            img_keys = [k for k in data.keys() if not k.startswith("_")]
+                            img_vals = {k: data[k] for k in img_keys if k not in ("content", "rawid")}
+                            log.info(f"🖼️ SSE图片字段: {json.dumps(img_vals, ensure_ascii=False)}")
                         self.add_to_buffer(data)
                 except json.JSONDecodeError:
                     pass
@@ -289,11 +313,22 @@ class WeFlowBridge:
             data = resp.json()
             messages = data if isinstance(data, list) else data.get("messages", data.get("data", []))
             if not isinstance(messages, list):
+                log.warning(f"消息API 返回非列表结构: keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}")
                 messages = []
 
+            # 诊断：打印前几条消息的字段，排查 mediaUrl 缺失原因
+            for i, msg in enumerate(messages[:3]):
+                mt = msg.get("mediaType", msg.get("media_type", ""))
+                mu = msg.get("mediaUrl", msg.get("media_url", ""))
+                keys = [k for k in msg.keys() if not k.startswith("_")][:10]
+                log.info(f"  msg[{i}]: mediaType={mt!r} mediaUrl={'✓' if mu else '✗'} keys={keys}")
+
+            found_image = False
             for msg in messages:
-                if msg.get("mediaType") == "image" and msg.get("mediaUrl"):
-                    media_url = msg["mediaUrl"]
+                media_type = msg.get("mediaType") or msg.get("media_type") or msg.get("type")
+                media_url = msg.get("mediaUrl") or msg.get("media_url")
+                if media_type == "image" and media_url:
+                    found_image = True
                     sep = "&" if "?" in media_url else "?"
                     dl_url = f"{media_url}{sep}access_token={config.ACCESS_TOKEN}"
 
@@ -319,12 +354,14 @@ class WeFlowBridge:
                     log.info(f"✅ 微信图片已保存: {save_path}")
                     return save_path
 
-            log.warning(f"消息列表无图片 mediaUrl (talker={talker})")
+            if not found_image:
+                log.warning(f"消息列表无图片 mediaUrl (talker={talker})")
+            else:
+                log.warning(f"图片 mediaUrl 下载失败 (talker={talker})")
             return None
         except Exception as e:
             log.error(f"获取微信图片异常: {e}")
             return None
-
     def _fetch_wechat_voice(self, talker: str) -> str | None:
         """从 WeFlow REST API 获取最新语音并保存到本地"""
         try:
@@ -396,10 +433,19 @@ class WeFlowBridge:
 
         talker_id = data.get("talkerId", "") or data.get("sessionId", "")
         is_group = bool(group_name) or "@chatroom" in session_id
+        sender_in_group = data.get("senderName", "") or data.get("sender", "") or data.get("sourceName", "")
 
         # 注册待处理的图片（ollama 完成前标记为 pending）
         img_event = threading.Event()
         self._pending_image[talker_id] = {"caption": None, "event": img_event}
+
+        # 计算 buffer 查找 key，与 add_to_buffer 保持一致
+        if is_group and state.group_reply_mode == "batch":
+            buffer_lookup_key = None  # batch 模式走独立分支
+        elif is_group and sender_in_group:
+            buffer_lookup_key = f"{session_id}_{sender_in_group}"
+        else:
+            buffer_lookup_key = talker_id
 
         try:
             # 取图 + ollama 描述
@@ -427,6 +473,8 @@ class WeFlowBridge:
                         entry = self.pending_buffers[batch_key]
                         entry["messages"].insert(0, f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]')
                         entry["image_ready"] = True
+                        if image_path:
+                            entry["image_path"] = image_path
                         log.info(f"📝 图片已注入批处理队列")
                         return
                     # 没有文字排队，用 batch key 创建独立条目
@@ -441,24 +489,27 @@ class WeFlowBridge:
                         "session_id_data": session_id,
                         "group_name": group_name,
                         "sender_in_group": source_name,
+                        "image_path": image_path,
                     }
-                    log.info(f"📩 图片无文本跟随，创建批处理图片条目")
                     version = 1
                     timer = threading.Timer(5, lambda v=version, sid=batch_key: self.process_sender(sid, v))
                     timer.daemon = True
                     timer.start()
                     self.pending_buffers[batch_key]["timer"] = timer
                     self.pending_buffers[batch_key]["timer_version"] = version
-                elif talker_id in self.pending_buffers:
+                elif buffer_lookup_key and buffer_lookup_key in self.pending_buffers:
                     # 已有文本在排队，注入图片上下文
-                    entry = self.pending_buffers[talker_id]
+                    entry = self.pending_buffers[buffer_lookup_key]
                     entry["messages"].insert(0, f"[图片: {caption_text}]")
                     entry["image_ready"] = True
+                    if image_path:
+                        entry["image_path"] = image_path
                     log.info(f"📝 图片已注入待处理文本队列")
                 else:
                     # 没有文本排队，创建单条图片消息处理
+                    final_key = buffer_lookup_key or talker_id
                     log.info(f"📩 图片无文本跟随，直接处理")
-                    self.pending_buffers[talker_id] = {
+                    self.pending_buffers[final_key] = {
                         "messages": [f"[图片: {caption_text}]"],
                         "timer": None,
                         "timer_version": 0,
@@ -468,14 +519,15 @@ class WeFlowBridge:
                         "source_name": source_name,
                         "session_id_data": session_id,
                         "group_name": group_name if is_group else "",
-                        "sender_in_group": "",
+                        "sender_in_group": sender_in_group if is_group else "",
+                        "image_path": image_path,
                     }
                     version = 1
-                    timer = threading.Timer(2, lambda v=version, sid=talker_id: self.process_sender(sid, v))
+                    timer = threading.Timer(2, lambda v=version, sid=final_key: self.process_sender(sid, v))
                     timer.daemon = True
                     timer.start()
-                    self.pending_buffers[talker_id]["timer"] = timer
-                    self.pending_buffers[talker_id]["timer_version"] = version
+                    self.pending_buffers[final_key]["timer"] = timer
+                    self.pending_buffers[final_key]["timer_version"] = version
         finally:
             # 确保 Event 被设置
             img_event.set()
