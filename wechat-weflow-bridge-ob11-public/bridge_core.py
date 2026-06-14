@@ -67,13 +67,15 @@ class WeFlowBridge:
         source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
 
         if content == "[图片]":
-            # 图片消息：下载 → ollama 描述 → 注入缓冲区
+            # 图片消息：即刻创建 buffer 占位条目（防竞态），后台线程下载+描述
+            self._ensure_buffer_for_media(data, source_name)
             threading.Thread(target=self.process_image_message,
                            args=(data,), daemon=True).start()
             return
 
         if content == "[语音]" or data.get("type", 0) == 34:
-            # 语音消息：下载 → 以 OneBot record 段推送
+            # 语音消息：即刻创建 buffer 占位条目，后台线程下载
+            self._ensure_buffer_for_media(data, source_name)
             threading.Thread(target=self.process_voice_message,
                            args=(data,), daemon=True).start()
             return
@@ -136,6 +138,56 @@ class WeFlowBridge:
                 timer.start()
                 entry["timer"] = timer
 
+
+    def _ensure_buffer_for_media(self, data, source_name):
+        """为图片/语音消息创建 buffer 占位条目（防竞态：后续文字可合并）"""
+        session_id_data = data.get("sessionId", "") or source_name
+        group_name_raw = data.get("groupName", "")
+        is_group = (data.get("sessionType", "") == "group") or bool(group_name_raw) or "@chatroom" in session_id_data
+        sender_in_group = data.get("senderName", "") or data.get("sender", "") or data.get("sourceName", "")
+
+        if is_group:
+            group_raw = group_name_raw or source_name
+            base_name = re.sub(r'\s*\(\d+\)\s*$', '', group_raw).strip()
+            contact = base_name
+        else:
+            contact = source_name
+
+        if is_group and state.group_reply_mode == "batch":
+            buffer_key = f"__batch__{contact}"
+        elif is_group and sender_in_group:
+            buffer_key = f"{session_id_data}_{sender_in_group}"
+        else:
+            buffer_key = session_id_data
+
+        with self.buffer_lock:
+            if buffer_key not in self.pending_buffers:
+                self.pending_buffers[buffer_key] = {
+                    "messages": [],
+                    "timer": None,
+                    "timer_version": 0,
+                    "processing": False,
+                    "contact": contact,
+                    "is_group": is_group,
+                    "source_name": source_name,
+                    "group_name": contact if is_group else "",
+                    "sender_in_group": sender_in_group if is_group else "",
+                    "session_id_data": session_id_data,
+                }
+            entry = self.pending_buffers[buffer_key]
+            entry["image_pending"] = True
+
+            if not entry["processing"]:
+                if entry["timer"]:
+                    entry["timer"].cancel()
+                entry["timer_version"] += 1
+                version = entry["timer_version"]
+                timer = threading.Timer(config.BUFFER_SECONDS,
+                                        lambda v=version, sid=buffer_key: self.process_sender(sid, v))
+                timer.daemon = True
+                timer.start()
+                entry["timer"] = timer
+
     def process_sender(self, sender_id, version=None):
         """缓冲到期：通过 OneBot 事件推送给 AstrBot。"""
         with self.buffer_lock:
@@ -145,6 +197,17 @@ class WeFlowBridge:
             if version is not None and entry.get("timer_version", 0) != version:
                 return
             if not entry["messages"]:
+                # 图片处理中？重新调度等待
+                if entry.get("image_pending") and not entry.get("image_path"):
+                    entry["timer_version"] += 1
+                    version = entry["timer_version"]
+                    timer = threading.Timer(config.BUFFER_SECONDS,
+                                            lambda v=version, sid=sender_id: self.process_sender(sid, v))
+                    timer.daemon = True
+                    timer.start()
+                    entry["timer"] = timer
+                    log.info(f"⏳ 图片尚未就绪，等待 {config.BUFFER_SECONDS}s...")
+                    return
                 return
             msgs = entry["messages"].copy()
             entry["messages"] = []
@@ -461,7 +524,7 @@ class WeFlowBridge:
                 log.info("⚠️ 图片描述失败")
                 caption_text = "（图片内容无法描述）"
 
-            # 注入图片描述到缓冲区
+            # 注入图片描述到缓冲区（buffer 条目已由 _ensure_buffer_for_media 创建）
             with self.buffer_lock:
                 self._pending_image[talker_id] = {"caption": caption_text, "event": img_event}
 
@@ -471,67 +534,52 @@ class WeFlowBridge:
                     batch_key = f"__batch__{g_base}"
                     if batch_key in self.pending_buffers:
                         entry = self.pending_buffers[batch_key]
-                        entry["messages"].insert(0, f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]')
-                        entry["image_ready"] = True
-                        if image_path:
-                            entry["image_path"] = image_path
-                        log.info(f"📝 图片已注入批处理队列")
-                        return
-                    # 没有文字排队，用 batch key 创建独立条目
-                    self.pending_buffers[batch_key] = {
-                        "messages": [f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]'],
-                        "timer": None,
-                        "timer_version": 0,
-                        "processing": False,
-                        "contact": group_name,
-                        "is_group": True,
-                        "source_name": source_name,
-                        "session_id_data": session_id,
-                        "group_name": group_name,
-                        "sender_in_group": source_name,
-                        "image_path": image_path,
-                    }
-                    version = 1
-                    timer = threading.Timer(5, lambda v=version, sid=batch_key: self.process_sender(sid, v))
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_buffers[batch_key]["timer"] = timer
-                    self.pending_buffers[batch_key]["timer_version"] = version
-                elif buffer_lookup_key and buffer_lookup_key in self.pending_buffers:
-                    # 已有文本在排队，注入图片上下文
-                    entry = self.pending_buffers[buffer_lookup_key]
-                    entry["messages"].insert(0, f"[图片: {caption_text}]")
-                    entry["image_ready"] = True
+                    else:
+                        # 防御：buffer 不存在时创建（不应发生）
+                        log.warning(f"批处理 buffer 缺失，创建: {batch_key}")
+                        self.pending_buffers[batch_key] = {
+                            "messages": [], "timer": None, "timer_version": 0,
+                            "processing": False, "contact": group_name,
+                            "is_group": True, "source_name": source_name,
+                            "session_id_data": session_id, "group_name": group_name,
+                            "sender_in_group": source_name,
+                        }
+                        entry = self.pending_buffers[batch_key]
+                    entry["messages"].insert(0, f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]')
                     if image_path:
                         entry["image_path"] = image_path
-                    log.info(f"📝 图片已注入待处理文本队列")
+                    entry["image_pending"] = False
+                    log.info(f"📝 图片已注入批处理队列")
                 else:
-                    # 没有文本排队，创建单条图片消息处理
-                    final_key = buffer_lookup_key or talker_id
-                    log.info(f"📩 图片无文本跟随，直接处理")
-                    self.pending_buffers[final_key] = {
-                        "messages": [f"[图片: {caption_text}]"],
-                        "timer": None,
-                        "timer_version": 0,
-                        "processing": False,
-                        "contact": group_name if is_group and group_name else source_name,
-                        "is_group": is_group,
-                        "source_name": source_name,
-                        "session_id_data": session_id,
-                        "group_name": group_name if is_group else "",
-                        "sender_in_group": sender_in_group if is_group else "",
-                        "image_path": image_path,
-                    }
-                    version = 1
-                    timer = threading.Timer(2, lambda v=version, sid=final_key: self.process_sender(sid, v))
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_buffers[final_key]["timer"] = timer
-                    self.pending_buffers[final_key]["timer_version"] = version
+                    lookup = buffer_lookup_key or talker_id
+                    if lookup in self.pending_buffers:
+                        entry = self.pending_buffers[lookup]
+                    else:
+                        # 防御：buffer 不存在时创建（不应发生）
+                        log.warning(f"buffer 缺失，创建: {lookup}")
+                        self.pending_buffers[lookup] = {
+                            "messages": [], "timer": None, "timer_version": 0,
+                            "processing": False,
+                            "contact": group_name if is_group and group_name else source_name,
+                            "is_group": is_group, "source_name": source_name,
+                            "session_id_data": session_id,
+                            "group_name": group_name if is_group else "",
+                            "sender_in_group": sender_in_group if is_group else "",
+                        }
+                        entry = self.pending_buffers[lookup]
+                    entry["messages"].insert(0, f"[图片: {caption_text}]")
+                    if image_path:
+                        entry["image_path"] = image_path
+                    entry["image_pending"] = False
+                    log.info(f"📝 图片已注入待处理文本队列")
         finally:
-            # 确保 Event 被设置
+            # 确保 Event 被设置，且 image_pending 不会卡死 process_sender
             img_event.set()
-
+            lookup = buffer_lookup_key or talker_id
+            if lookup:
+                with self.buffer_lock:
+                    if lookup in self.pending_buffers:
+                        self.pending_buffers[lookup]["image_pending"] = False
 
 
     def process_voice_message(self, data):
