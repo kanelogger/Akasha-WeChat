@@ -71,6 +71,10 @@ async def _handle_ob_api(data: dict):
                 if text:
                     await asyncio.to_thread(state.sender_instance.send_text, contact, text)
                     log.info(f"[OB11] 文字已发送至 {contact}: {text[:50]}")
+                    # 记录到对话历史
+                    if config.MEMORY_ENABLED:
+                        import memory
+                        memory.add_message(str(contact), "assistant", text)
 
             elif seg_type == "image":
                 file_val = seg_data.get("file", "")

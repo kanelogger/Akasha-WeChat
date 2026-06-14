@@ -150,12 +150,14 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(
       <div class="status-card"><div class="label">AstrBot</div><div class="value" id="obStatus">-</div></div>
       <div class="status-card"><div class="label">WeFlow</div><div class="value" id="weflowStatus">-</div></div>
       <div class="status-card"><div class="label">发送模式</div><div class="value" id="sendMethod" style="font-size:13px">-</div></div>
+      <div class="status-card"><div class="label">对话记忆</div><div class="value" id="memoryStatus" style="font-size:12px">-</div></div>
     </div>
 
     <div class="btn-row">
       <button class="btn btn-pink" id="btnStart" onclick="action('start')">▶ 启动</button>
       <button class="btn btn-red" id="btnStop" onclick="action('stop')" disabled>■ 停止</button>
       <button class="btn btn-amber" id="btnPause" onclick="action('pause')" disabled>⏸ 暂停</button>
+      <button class="btn btn-outline" id="btnClearMemory" onclick="clearMemory()" style="padding:5px 14px;font-size:12px">🧹 清除记忆</button>
       <button class="btn btn-green" id="btnResume" onclick="action('resume')" style="display:none" disabled>▶ 恢复</button>
     </div>
 
@@ -229,6 +231,9 @@ function refreshDashboard() {
     document.getElementById('weflowStatus').textContent = s.weflow_connected ? '已连接' : '未连接';
     document.getElementById('weflowStatus').style.color = s.weflow_connected ? '#4caf50' : '#bdbdbd';
     document.getElementById('sendMethod').textContent = s.send_method;
+    var memEl = document.getElementById('memoryStatus');
+    if (s.memory_enabled) { memEl.textContent = '开启 (' + s.memory_max_messages + '条/' + s.memory_ttl_minutes + 'min)'; memEl.style.color = '#4caf50'; }
+    else { memEl.textContent = '关闭'; memEl.style.color = '#bdbdbd'; }
 
     document.getElementById('btnStart').disabled = s.running;
     document.getElementById('btnStop').disabled = !s.running;
@@ -253,6 +258,13 @@ function refreshDashboard() {
 
 function action(cmd) {
   fetch('/' + cmd, {method:'POST'}).then(function(){setTimeout(refreshDashboard,500)});
+}
+function clearMemory() {
+  if (!confirm('确定要清除全部对话记忆吗？')) return;
+  fetch('/api/memory/clear', {method:'POST'}).then(function(r){return r.json()}).then(function(res){
+    if (res.ok) { toast('记忆已清除', 'success'); setTimeout(refreshDashboard, 300); }
+    else { toast('清除失败', 'error'); }
+  }).catch(function(){ toast('清除失败', 'error'); });
 }
 
 document.getElementById('btnToggleMode').onclick = function(){
@@ -384,6 +396,9 @@ class WebHandler(BaseHTTPRequestHandler):
                 "ob_connected": ob_connected,
                 "weflow_connected": weflow_connected,
                 "group_reply_mode": state.group_reply_mode,
+                "memory_enabled": config.MEMORY_ENABLED,
+                "memory_max_messages": config.MEMORY_MAX_MESSAGES,
+                "memory_ttl_minutes": config.MEMORY_TTL_MINUTES,
                 "log": "\n".join(log_lines),
             })
         elif self.path == "/api/config":
@@ -462,6 +477,15 @@ class WebHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True})
             except Exception as e:
                 log.error(f"[Web] 保存配置异常: {e}")
+                self.send_json({"ok": False, "error": str(e)}, 500)
+        elif self.path == "/api/memory/clear":
+            try:
+                import memory
+                memory.clear_history()
+                log.info("[Web] 已清除全部对话记忆")
+                self.send_json({"ok": True})
+            except Exception as e:
+                log.error(f"[Web] 清除记忆失败: {e}")
                 self.send_json({"ok": False, "error": str(e)}, 500)
         else:
             self.send_json({"ok": False}, 404)

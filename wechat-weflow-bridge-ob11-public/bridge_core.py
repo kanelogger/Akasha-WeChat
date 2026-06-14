@@ -16,7 +16,6 @@ import queue
 import re
 import threading
 import time
-from collections import defaultdict
 from datetime import datetime
 
 import requests
@@ -40,7 +39,6 @@ class WeFlowBridge:
         self.start_timestamp = int(time.time())
         self.pending_buffers = {}
         self.buffer_lock = threading.Lock()
-        self.chat_histories = defaultdict(list)
         self.contact_map = {}
         self._sse_session = None
         self._recent_seen = {}
@@ -219,6 +217,8 @@ class WeFlowBridge:
         contact = entry.get("contact", sender_id)
         is_group = entry.get("is_group", False)
         combined = "\n".join(msgs)
+        # 保存用户原始消息文本（在注入历史前捕获，用于后续记录）
+        user_raw_text = combined
         log.info(f"推送 {len(msgs)} 条消息 [{'群' if is_group else '私'}|{contact}]")
 
         # 构建 OneBot 事件（user_id 要用发言人身份，不能用群 sessionId）
@@ -247,6 +247,16 @@ class WeFlowBridge:
                 if sender_name:
                     formatted = f'{sender_name}在群{entry.get("group_name", contact)}中说：{clean_text}'
 
+            # 注入对话历史（群聊）
+            if config.MEMORY_ENABLED:
+                import memory
+                conv_key = contact
+                history = memory.get_history(conv_key)
+                if history:
+                    history_text = memory.format_history(history)
+                    if history_text:
+                        formatted = history_text + "\n" + formatted
+
             # 消息段：先 at 机器人（让 aiocqhttp 识别为 @），再发图片（如有），最后发文本
             msg_segments = [
                 {"type": "at", "data": {"qq": str(state._self_id_int)}},
@@ -267,6 +277,15 @@ class WeFlowBridge:
                                        nickname=sender_name)
         else:
             sender_name = entry.get("source_name", contact)
+            # 注入对话历史（私聊）
+            if config.MEMORY_ENABLED:
+                import memory
+                conv_key = contact
+                history = memory.get_history(conv_key)
+                if history:
+                    history_text = memory.format_history(history)
+                    if history_text:
+                        combined = history_text + "\n" + combined
             msg_segments = [{"type": "text", "data": {"text": combined}}]
             image_path = entry.get("image_path")
             if image_path and os.path.exists(image_path):
@@ -289,6 +308,11 @@ class WeFlowBridge:
         sent = push_event(event)
         if sent > 0:
             log.info(f"✅ 已推送至 {sent} 个 AstrBot 客户端 [{contact}]")
+            # 记录到对话历史
+            if config.MEMORY_ENABLED:
+                import memory
+                conv_key = contact
+                memory.add_message(conv_key, "user", user_raw_text)
         else:
             log.warning(f"⚠️ 无 AstrBot 客户端在线 [{contact}]")
 

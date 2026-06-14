@@ -52,6 +52,12 @@ IMAGE_CAPTION_PROMPT = config.get("image_caption_prompt", "请用中文简短描
 OLLAMA_BASE_URL = config.get("ollama_base_url", "http://127.0.0.1:61000")
 OLLAMA_TIMEOUT = config.get("ollama_timeout", 60)
 
+
+# ============ 对话记忆 ============
+
+MEMORY_ENABLED = config.get("memory_enabled", True)
+MEMORY_MAX_MESSAGES = config.get("memory_max_messages", 20)
+MEMORY_TTL_MINUTES = config.get("memory_ttl_minutes", 30)
 # ============ 鼠标漫游（反风控）============
 
 WANDERER_ENABLED = config.get("wanderer_enabled", False)

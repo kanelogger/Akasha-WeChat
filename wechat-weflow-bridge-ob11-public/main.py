@@ -125,6 +125,9 @@ def _bridge_loop():
     bridge = WeFlowBridge(state.sender_instance)
     with state.bridge_lock:
         state.bridge_instance = bridge
+    if config.MEMORY_ENABLED:
+        import memory
+        log.info(f"[Memory] 临时记忆已启用（{config.MEMORY_MAX_MESSAGES}条，TTL={config.MEMORY_TTL_MINUTES}分钟）")
 
     try:
         # 用 SSE 端点做探活（stream=True 只检查状态码，不读 body）
