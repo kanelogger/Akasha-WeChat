@@ -54,9 +54,7 @@ class WeFlowBridge:
             return True
         if config.BOT_WXID and data.get("talkerId", "") == config.BOT_WXID:
             return True
-        if msg_type in (34,):  # 34=语音
-            return True
-        if content and ("[语音]" in content or "[表情]" in content):
+        if content and ("[表情]" in content):
             return True
         if not content or content.strip() == "":
             return True
@@ -70,6 +68,12 @@ class WeFlowBridge:
         if content == "[图片]":
             # 图片消息：下载 → ollama 描述 → 注入缓冲区
             threading.Thread(target=self.process_image_message,
+                           args=(data,), daemon=True).start()
+            return
+
+        if content == "[语音]" or data.get("type", 0) == 34:
+            # 语音消息：下载 → 以 OneBot record 段推送
+            threading.Thread(target=self.process_voice_message,
                            args=(data,), daemon=True).start()
             return
 
@@ -321,6 +325,65 @@ class WeFlowBridge:
             log.error(f"获取微信图片异常: {e}")
             return None
 
+    def _fetch_wechat_voice(self, talker: str) -> str | None:
+        """从 WeFlow REST API 获取最新语音并保存到本地"""
+        try:
+            url = f"{config.WE_FLOW_BASE_URL}/api/v1/messages"
+            params = {
+                "access_token": config.ACCESS_TOKEN,
+                "talker": talker,
+                "media": "true",
+                "limit": 3,
+            }
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code != 200:
+                log.error(f"WeFlow 消息API: HTTP {resp.status_code}")
+                return None
+
+            data = resp.json()
+            messages = data if isinstance(data, list) else data.get("messages", data.get("data", []))
+            if not isinstance(messages, list):
+                messages = []
+
+            for msg in messages:
+                media_type = msg.get("mediaType", "")
+                if media_type in ("voice", "audio") and msg.get("mediaUrl"):
+                    media_url = msg["mediaUrl"]
+                    sep = "&" if "?" in media_url else "?"
+                    dl_url = f"{media_url}{sep}access_token={config.ACCESS_TOKEN}"
+
+                    voice_resp = requests.get(dl_url, timeout=30)
+                    if voice_resp.status_code != 200:
+                        continue
+
+                    ct = voice_resp.headers.get("Content-Type", "")
+                    ext = ".amr"
+                    if "mp3" in ct or "mpeg" in ct:
+                        ext = ".mp3"
+                    elif "ogg" in ct:
+                        ext = ".ogg"
+                    elif "wav" in ct:
+                        ext = ".wav"
+                    elif "silk" in ct:
+                        ext = ".silk"
+
+                    filename = f"wechat_{int(time.time())}{ext}"
+                    save_dir = os.path.join(config.ASTRBOT_ATTACHMENTS, "wechat_voice")
+                    os.makedirs(save_dir, exist_ok=True)
+                    save_path = os.path.join(save_dir, filename)
+
+                    with open(save_path, "wb") as f:
+                        f.write(voice_resp.content)
+
+                    log.info(f"✅ 微信语音已保存: {save_path}")
+                    return save_path
+
+            log.warning(f"消息列表无语音 mediaUrl (talker={talker})")
+            return None
+        except Exception as e:
+            log.error(f"获取微信语音异常: {e}")
+            return None
+
     def process_image_message(self, data):
         """处理图片消息：从 WeFlow 取图 → ollama 描述 → 注入缓冲区"""
         session_id = data.get("sessionId", "")
@@ -417,6 +480,50 @@ class WeFlowBridge:
             # 确保 Event 被设置
             img_event.set()
 
+
+
+    def process_voice_message(self, data):
+        """处理语音消息：从 WeFlow 下载语音 → 以 OneBot record 段推送"""
+        session_id = data.get("sessionId", "")
+        source_name = data.get("sourceName", "") or "未知"
+        group_name = data.get("groupName", "")
+        is_group = bool(group_name) or "@chatroom" in session_id
+
+        log.info(f"🎤 收到语音: {source_name}" +
+                 (f" (群:{group_name})" if group_name else ""))
+
+        voice_path = self._fetch_wechat_voice(session_id)
+        if not voice_path:
+            log.warning(f"⚠️ 语音下载失败 [{source_name}]")
+            return
+
+        # 计算 user_id / group_id
+        if is_group:
+            sender_wxid = f"{session_id}_{source_name}"
+            user_id = state._wxid_to_int(sender_wxid)
+            group_id = state._wxid_to_int(group_name)
+            msg_segments = [
+                {"type": "record", "data": {"file": f"file:///{voice_path}"}},
+            ]
+            event = make_message_event("group", user_id, msg_segments,
+                                       group_id=group_id,
+                                       group_name=group_name,
+                                       nickname=source_name)
+            state._ob_id_to_contact[group_id] = group_name
+        else:
+            user_id = state._wxid_to_int(session_id)
+            msg_segments = [
+                {"type": "record", "data": {"file": f"file:///{voice_path}"}},
+            ]
+            event = make_message_event("private", user_id, msg_segments,
+                                       nickname=source_name)
+            state._ob_id_to_contact[user_id] = source_name
+
+        sent = push_event(event)
+        if sent > 0:
+            log.info(f"✅ 语音已推送至 AstrBot [{source_name}]")
+        else:
+            log.warning(f"⚠️ 无 AstrBot 客户端在线 [{source_name}]")
 
 def caption_image_via_ollama(image_path: str) -> str | None:
     """对图片进行文字描述，支持 ollama 和 OpenAI 兼容 API 两种后端。"""
